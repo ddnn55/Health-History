@@ -557,9 +557,9 @@ struct ContentView: View {
             .padding(.top, 2)
             .padding(.bottom, 12)
             .frame(width: proxy.size.width, height: proxy.size.height, alignment: .top)
-            .background(Color(.systemGroupedBackground))
+            .background(Color(.systemBackground))
         }
-        .background(Color(.systemGroupedBackground))
+        .background(Color(.systemBackground))
         .task {
             if hasRequestedHealthAccess {
                 await healthStore.requestAccess(range: selectedRange, anchorDate: anchorDate)
@@ -636,38 +636,23 @@ struct ContentView: View {
     }
 
     private var rangePicker: some View {
-        HStack(spacing: 2) {
+        Picker("Range", selection: rangeSelection) {
             ForEach(HealthRange.allCases) { range in
-                Button {
-                    anchorDate = visibleInterval.midpoint
-                    settledVisibleInterval = nil
-                    selectedRange = range
-                } label: {
-                    Text(range.rawValue)
-                        .font(.system(size: 15, weight: .semibold))
-                        .foregroundStyle(selectedRange == range ? .primary : .secondary)
-                        .frame(maxWidth: .infinity, minHeight: 34)
-                        .contentShape(RoundedRectangle(cornerRadius: 17))
-                }
-                .buttonStyle(.plain)
-                .background {
-                    if selectedRange == range {
-                        RoundedRectangle(cornerRadius: 17)
-                            .fill(.ultraThinMaterial)
-                            .overlay {
-                                RoundedRectangle(cornerRadius: 17)
-                                    .stroke(.white.opacity(0.45), lineWidth: 0.8)
-                            }
-                            .shadow(color: .black.opacity(0.08), radius: 8, y: 3)
-                    }
-                }
+                Text(range.rawValue)
+                    .tag(range)
             }
         }
-        .padding(3)
-        .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 20))
-        .overlay {
-            RoundedRectangle(cornerRadius: 20)
-                .stroke(.white.opacity(0.3), lineWidth: 0.8)
+        .pickerStyle(.segmented)
+        .glassEffect(in: RoundedRectangle(cornerRadius: 20))
+    }
+
+    private var rangeSelection: Binding<HealthRange> {
+        Binding {
+            selectedRange
+        } set: { newRange in
+            anchorDate = visibleInterval.midpoint
+            settledVisibleInterval = nil
+            selectedRange = newRange
         }
     }
 
@@ -876,10 +861,23 @@ private struct HealthMetricChart: View {
                         .foregroundStyle(Color(.systemGray4))
                 }
                 if showsXAxisLabels {
-                    AxisMarks(values: .stride(by: xLabelStride.component, count: xLabelStride.count)) { _ in
-                        AxisValueLabel(format: xAxisFormat)
-                            .font(.system(size: 18, weight: .medium))
-                            .foregroundStyle(Color(.systemGray3))
+                    AxisMarks(values: xMajorLabelTicks.map(\.date)) { value in
+                        if let date = value.as(Date.self), let tick = xMajorLabelTicks.first(where: { $0.date == date }) {
+                            AxisValueLabel {
+                                Text(tick.label)
+                                    .font(.system(size: 18, weight: .semibold))
+                                    .foregroundStyle(Color(.systemGray2))
+                            }
+                        }
+                    }
+                    AxisMarks(values: xMinorLabelTicks.map(\.date)) { value in
+                        if let date = value.as(Date.self), let tick = xMinorLabelTicks.first(where: { $0.date == date }) {
+                            AxisValueLabel {
+                                Text(tick.label)
+                                    .font(.system(size: 18, weight: .medium))
+                                    .foregroundStyle(Color(.systemGray3))
+                            }
+                        }
                     }
                 }
             }
@@ -955,28 +953,11 @@ private struct HealthMetricChart: View {
             .glassEffect(in: Capsule())
     }
 
-    private var xAxisFormat: Date.FormatStyle {
-        switch range {
-        case .day:
-            return .dateTime.hour()
-        case .week, .month:
-            return .dateTime.day()
-        case .sixMonths, .year:
-            return .dateTime.month(.narrow)
-        case .decade:
-            return .dateTime.year(.twoDigits)
-        case .all:
-            switch range.bucketComponent(for: interval) {
-            case .hour:
-                return .dateTime.hour()
-            case .day, .weekOfYear:
-                return .dateTime.month(.narrow).day()
-            case .month:
-                return .dateTime.month(.narrow)
-            default:
-                return .dateTime.year(.twoDigits)
-            }
-        }
+    private struct XAxisTick: Identifiable {
+        let date: Date
+        let label: String
+
+        var id: Date { date }
     }
 
     private var xGridStride: (component: Calendar.Component, count: Int) {
@@ -1007,7 +988,77 @@ private struct HealthMetricChart: View {
         }
     }
 
-    private var xLabelStride: (component: Calendar.Component, count: Int) {
+    private var xMajorLabelTicks: [XAxisTick] {
+        let component = xMajorLabelComponent
+        let boundaries = dates(matching: component, step: 1, in: interval)
+        let boundaryTicks = boundaries.map { date in
+            XAxisTick(date: date, label: xMajorLabel(for: date, component: component))
+        }
+
+        if boundaryTicks.isEmpty, let label = xLeftEdgeMajorLabel {
+            return [XAxisTick(date: interval.start, label: label)]
+        }
+
+        return boundaryTicks
+    }
+
+    private var xMinorLabelTicks: [XAxisTick] {
+        let rawTicks = dates(matching: xMinorLabelStride.component, step: xMinorLabelStride.count, in: interval)
+            .filter { date in
+                !isDate(date, nearAny: xMajorLabelTicks.map(\.date), tolerance: xMajorMinorCollisionTolerance)
+            }
+            .map { date in
+                XAxisTick(date: date, label: xMinorLabel(for: date))
+            }
+
+        return thinXAxisTicks(rawTicks, preserving: xMajorLabelTicks)
+    }
+
+    private var xMajorLabelComponent: Calendar.Component {
+        switch range {
+        case .day:
+            return .day
+        case .week, .month, .sixMonths:
+            return .month
+        case .year, .decade:
+            return .year
+        case .all:
+            switch range.bucketComponent(for: interval) {
+            case .hour, .day, .weekOfYear:
+                return .month
+            default:
+                return .year
+            }
+        }
+    }
+
+    private var xLeftEdgeMajorLabel: String? {
+        switch xMajorLabelComponent {
+        case .day:
+            return shortMonthDayFormatter.string(from: interval.start)
+        case .month:
+            return monthFormatter.string(from: interval.start)
+        case .year:
+            return yearFormatter.string(from: interval.start)
+        default:
+            return nil
+        }
+    }
+
+    private var xMajorMinorCollisionTolerance: TimeInterval {
+        switch xMajorLabelComponent {
+        case .day:
+            return 3_600
+        case .month:
+            return 86_400
+        case .year:
+            return 86_400 * 7
+        default:
+            return 1
+        }
+    }
+
+    private var xMinorLabelStride: (component: Calendar.Component, count: Int) {
         switch range {
         case .day:
             return (.hour, 6)
@@ -1034,6 +1085,123 @@ private struct HealthMetricChart: View {
             default:
                 return (.year, 2)
             }
+        }
+    }
+
+    private var maximumMinorXAxisLabels: Int {
+        switch range {
+        case .day, .week:
+            return 4
+        case .month, .sixMonths, .year:
+            return 3
+        case .decade, .all:
+            return 4
+        }
+    }
+
+    private var monthFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "MMM"
+        return formatter
+    }
+
+    private var shortMonthDayFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.setLocalizedDateFormatFromTemplate("MMM d")
+        return formatter
+    }
+
+    private var dayFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "d"
+        return formatter
+    }
+
+    private var hourFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.setLocalizedDateFormatFromTemplate("ha")
+        return formatter
+    }
+
+    private var yearFormatter: DateFormatter {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "yyyy"
+        return formatter
+    }
+
+    private func xMajorLabel(for date: Date, component: Calendar.Component) -> String {
+        switch component {
+        case .day:
+            return shortMonthDayFormatter.string(from: date)
+        case .month:
+            return monthFormatter.string(from: date)
+        case .year:
+            return yearFormatter.string(from: date)
+        default:
+            return ""
+        }
+    }
+
+    private func xMinorLabel(for date: Date) -> String {
+        switch xMinorLabelStride.component {
+        case .hour:
+            return hourFormatter.string(from: date)
+        case .day:
+            return dayFormatter.string(from: date)
+        case .month:
+            return monthFormatter.string(from: date)
+        case .year:
+            return yearFormatter.string(from: date)
+        default:
+            return ""
+        }
+    }
+
+    private func dates(matching component: Calendar.Component, step: Int, in interval: DateInterval) -> [Date] {
+        guard step > 0, var date = Calendar.current.dateInterval(of: component, for: interval.start)?.start else {
+            return []
+        }
+
+        let tolerance: TimeInterval = 0.001
+        if date < interval.start.addingTimeInterval(-tolerance) {
+            guard let nextDate = Calendar.current.date(byAdding: component, value: step, to: date) else {
+                return []
+            }
+            date = nextDate
+        }
+
+        var dates: [Date] = []
+        while date <= interval.end.addingTimeInterval(tolerance) {
+            if date >= interval.start.addingTimeInterval(-tolerance) {
+                dates.append(date)
+            }
+
+            guard let nextDate = Calendar.current.date(byAdding: component, value: step, to: date), nextDate > date else {
+                break
+            }
+            date = nextDate
+        }
+
+        return dates
+    }
+
+    private func isDate(_ date: Date, nearAny dates: [Date], tolerance: TimeInterval) -> Bool {
+        dates.contains { abs($0.timeIntervalSince(date)) <= tolerance }
+    }
+
+    private func thinXAxisTicks(_ ticks: [XAxisTick], preserving majorTicks: [XAxisTick]) -> [XAxisTick] {
+        guard ticks.count > maximumMinorXAxisLabels else {
+            return ticks
+        }
+
+        let stride = Int(ceil(Double(ticks.count) / Double(maximumMinorXAxisLabels)))
+        return ticks.enumerated().compactMap { index, tick in
+            index.isMultiple(of: stride) ? tick : nil
         }
     }
 
