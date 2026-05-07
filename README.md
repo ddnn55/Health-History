@@ -2,6 +2,10 @@
 
 An iOS app that charts your Apple Health data across longer time ranges than the built-in Health app allows.
 
+## Build Conversation
+
+[PROMPTS.md](PROMPTS.md) contains the complete conversation with Codex that built this app — from Xcode's iOS boilerplate to the current version.
+
 ## Motivation
 
 The Apple Health app caps its charts at one year of history. If you want to see how your weight trended over the last decade, or view your step count from day one, you're out of luck. Health History fixes that by adding **10Y** and **ALL** range options alongside the standard short-term views.
