@@ -102,6 +102,10 @@ private struct CachedRangeData {
 }
 
 private extension DateInterval {
+    var midpoint: Date {
+        start.addingTimeInterval(duration / 2)
+    }
+
     func clamped(to bounds: DateInterval?) -> DateInterval {
         guard let bounds else {
             return self
@@ -181,14 +185,20 @@ private final class HealthChartStore: ObservableObject {
     }
 
     func load(range: HealthRange, anchorDate: Date) async {
+        await load(
+            range: range,
+            visibleInterval: visibleInterval(for: range, anchorDate: anchorDate),
+            preloadAnchorDate: anchorDate
+        )
+    }
+
+    func load(range: HealthRange, visibleInterval: DateInterval) async {
         guard case .authorized = accessState else {
             return
         }
 
         loadSequence += 1
         let sequence = loadSequence
-
-        let visibleInterval = visibleInterval(for: range, anchorDate: anchorDate)
 
         if let cachedData = cachedData(for: range, visibleInterval: visibleInterval) {
             apply(cachedData, visibleInterval: visibleInterval)
@@ -206,7 +216,34 @@ private final class HealthChartStore: ObservableObject {
 
         apply(data, visibleInterval: visibleInterval)
         isLoading = false
-        preloadRanges(anchorDate: anchorDate, skipping: range)
+        preloadRanges(anchorDate: visibleInterval.midpoint, skipping: range)
+    }
+
+    private func load(range: HealthRange, visibleInterval: DateInterval, preloadAnchorDate: Date) async {
+        guard case .authorized = accessState else {
+            return
+        }
+
+        loadSequence += 1
+        let sequence = loadSequence
+
+        if let cachedData = cachedData(for: range, visibleInterval: visibleInterval) {
+            apply(cachedData, visibleInterval: visibleInterval)
+            isLoading = false
+            return
+        }
+
+        isLoading = true
+        let data = await fetchData(range: range, visibleInterval: visibleInterval)
+        rangeCache[range] = data
+
+        guard sequence == loadSequence else {
+            return
+        }
+
+        apply(data, visibleInterval: visibleInterval)
+        isLoading = false
+        preloadRanges(anchorDate: preloadAnchorDate, skipping: range)
     }
 
     func ensureBuffered(range: HealthRange, visibleInterval: DateInterval) async {
@@ -465,7 +502,8 @@ struct ContentView: View {
     @AppStorage("hasRequestedHealthAccess") private var hasRequestedHealthAccess = false
     @State private var selectedRange: HealthRange = .year
     @State private var anchorDate = Date()
-    @State private var dragStartAnchorDate: Date?
+    @State private var settledVisibleInterval: DateInterval?
+    @State private var dragStartInterval: DateInterval?
     @State private var dragTranslation: CGFloat = 0
     @State private var bufferTask: Task<Void, Never>?
 
@@ -495,7 +533,8 @@ struct ContentView: View {
                     points: healthStore.weight.points,
                     style: .line(color: .purple),
                     isLoading: healthStore.isLoading,
-                    chartHeight: chartHeight
+                    chartHeight: chartHeight,
+                    showsXAxisLabels: false
                 )
                 .simultaneousGesture(chartDragGesture)
 
@@ -508,7 +547,8 @@ struct ContentView: View {
                     points: healthStore.steps.points,
                     style: .bar(color: .orange),
                     isLoading: healthStore.isLoading,
-                    chartHeight: chartHeight
+                    chartHeight: chartHeight,
+                    showsXAxisLabels: true
                 )
                 .simultaneousGesture(chartDragGesture)
 
@@ -531,30 +571,37 @@ struct ContentView: View {
                 await healthStore.load(range: newRange, anchorDate: anchorDate)
             }
         }
-        .onChange(of: anchorDate) { _, newDate in
-            Task {
-                await healthStore.load(range: selectedRange, anchorDate: newDate)
-            }
-        }
     }
 
     private var baseInterval: DateInterval {
-        let interval = selectedRange.interval(
-            containing: dragStartAnchorDate ?? anchorDate,
+        if let dragStartInterval {
+            return dragStartInterval
+        }
+
+        if let settledVisibleInterval, selectedRange != .all {
+            return settledVisibleInterval
+        }
+
+        return selectedRange.interval(
+            containing: anchorDate,
             calendar: calendar,
             availableInterval: healthStore.availableInterval
         )
-        return interval.clamped(to: selectedRange == .all ? nil : healthStore.availableInterval)
+        .clamped(to: selectedRange == .all ? nil : healthStore.availableInterval)
     }
 
     private var visibleInterval: DateInterval {
-        guard selectedRange != .all, dragTranslation != 0 else {
+        guard selectedRange != .all else {
             return selectedRange.interval(
                 containing: anchorDate,
                 calendar: calendar,
                 availableInterval: healthStore.availableInterval
             )
             .clamped(to: selectedRange == .all ? nil : healthStore.availableInterval)
+        }
+
+        if dragTranslation == 0 {
+            return settledVisibleInterval ?? baseInterval
         }
 
         return dragInterval(for: dragTranslation)
@@ -566,26 +613,25 @@ struct ContentView: View {
                 guard selectedRange != .all, abs(value.translation.width) > abs(value.translation.height) * 1.35 else {
                     return
                 }
-                if dragStartAnchorDate == nil {
-                    dragStartAnchorDate = anchorDate
+                if dragStartInterval == nil {
+                    dragStartInterval = visibleInterval
                 }
                 dragTranslation = value.translation.width
                 ensureBufferedData(for: dragInterval(for: value.translation.width))
             }
             .onEnded { value in
-                guard selectedRange != .all, let startAnchorDate = dragStartAnchorDate else {
+                guard selectedRange != .all, dragStartInterval != nil else {
                     resetDrag()
                     return
                 }
 
-                let startingInterval = selectedRange.interval(
-                    containing: startAnchorDate,
-                    calendar: calendar,
-                    availableInterval: healthStore.availableInterval
-                )
-                let offset = dragOffsetSeconds(for: value.translation.width, in: startingInterval)
-                anchorDate = startAnchorDate.addingTimeInterval(offset)
+                let releasedInterval = dragInterval(for: value.translation.width)
+                settledVisibleInterval = releasedInterval
+                anchorDate = releasedInterval.midpoint
                 resetDrag()
+                Task {
+                    await healthStore.load(range: selectedRange, visibleInterval: releasedInterval)
+                }
             }
     }
 
@@ -593,6 +639,8 @@ struct ContentView: View {
         HStack(spacing: 2) {
             ForEach(HealthRange.allCases) { range in
                 Button {
+                    anchorDate = visibleInterval.midpoint
+                    settledVisibleInterval = nil
                     selectedRange = range
                 } label: {
                     Text(range.rawValue)
@@ -681,7 +729,7 @@ struct ContentView: View {
 
     private func resetDrag() {
         bufferTask?.cancel()
-        dragStartAnchorDate = nil
+        dragStartInterval = nil
         dragTranslation = 0
     }
 }
@@ -708,6 +756,7 @@ private struct HealthMetricChart: View {
     let style: Style
     let isLoading: Bool
     let chartHeight: CGFloat
+    let showsXAxisLabels: Bool
 
     private var formattedValue: String {
         if unit == "steps" {
@@ -717,7 +766,7 @@ private struct HealthMetricChart: View {
         }
     }
 
-    private var yDomain: ClosedRange<Double> {
+    private var rawYDomain: ClosedRange<Double> {
         guard !visiblePoints.isEmpty else {
             return 0...1
         }
@@ -737,11 +786,28 @@ private struct HealthMetricChart: View {
         }
     }
 
+    private var yDomain: ClosedRange<Double> {
+        niceYDomain(for: rawYDomain)
+    }
+
     private var yAxisValues: [Double] {
-        let lower = yDomain.lowerBound
-        let upper = yDomain.upperBound
-        let middle = lower + (upper - lower) / 2
-        return [upper, middle, lower]
+        niceTicks(for: yDomain, targetCount: 4)
+    }
+
+    private var yAxisLabelValues: [Double] {
+        let labels: [Double]
+        switch style {
+        case .line:
+            labels = yAxisValues
+        case .bar:
+            labels = yAxisValues.filter { $0 > yDomainStepEpsilon }
+        }
+
+        return thinnedYAxisLabels(labels)
+    }
+
+    private var yDomainStepEpsilon: Double {
+        max(abs(yDomain.upperBound - yDomain.lowerBound) * 0.000_001, 0.000_001)
     }
 
     private var visiblePoints: [ChartPoint] {
@@ -809,10 +875,12 @@ private struct HealthMetricChart: View {
                     AxisGridLine(stroke: StrokeStyle(lineWidth: 1, dash: [5, 5]))
                         .foregroundStyle(Color(.systemGray4))
                 }
-                AxisMarks(values: .stride(by: xLabelStride.component, count: xLabelStride.count)) { _ in
-                    AxisValueLabel(format: xAxisFormat)
-                        .font(.system(size: 18, weight: .medium))
-                        .foregroundStyle(Color(.systemGray3))
+                if showsXAxisLabels {
+                    AxisMarks(values: .stride(by: xLabelStride.component, count: xLabelStride.count)) { _ in
+                        AxisValueLabel(format: xAxisFormat)
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundStyle(Color(.systemGray3))
+                    }
                 }
             }
             .frame(height: chartHeight)
@@ -837,7 +905,7 @@ private struct HealthMetricChart: View {
                 GeometryReader { geometry in
                     if let plotFrame = chartProxy.plotFrame {
                         let plotRect = geometry[plotFrame]
-                        ForEach(yAxisValues, id: \.self) { yValue in
+                        ForEach(yAxisLabelValues, id: \.self) { yValue in
                             if let yPosition = chartProxy.position(forY: yValue) {
                                 yAxisLabel(yValue)
                                     .position(
@@ -871,6 +939,10 @@ private struct HealthMetricChart: View {
         if unit == "steps" {
             return value.formatted(.number.precision(.fractionLength(0)))
         }
+        let rounded = value.rounded()
+        if abs(value - rounded) < 0.000_001 {
+            return rounded.formatted(.number.precision(.fractionLength(0)))
+        }
         return value.formatted(.number.precision(.fractionLength(1)))
     }
 
@@ -880,16 +952,7 @@ private struct HealthMetricChart: View {
             .foregroundStyle(Color(.secondaryLabel))
             .padding(.horizontal, 9)
             .padding(.vertical, 5)
-            .background {
-                Capsule()
-                    .fill(Color(.systemBackground).opacity(0.68))
-                    .background(.ultraThinMaterial, in: Capsule())
-            }
-            .overlay {
-                Capsule()
-                    .stroke(.white.opacity(0.72), lineWidth: 0.8)
-            }
-            .shadow(color: .black.opacity(0.12), radius: 8, y: 3)
+            .glassEffect(in: Capsule())
     }
 
     private var xAxisFormat: Date.FormatStyle {
@@ -984,6 +1047,98 @@ private struct HealthMetricChart: View {
 
     private func barInset(for point: ChartPoint) -> TimeInterval {
         max(0, point.endDate.timeIntervalSince(point.date) * 0.08)
+    }
+
+    private func niceYDomain(for domain: ClosedRange<Double>) -> ClosedRange<Double> {
+        let lower = domain.lowerBound
+        let upper = domain.upperBound
+        guard lower.isFinite, upper.isFinite, lower < upper else {
+            return 0...1
+        }
+
+        let step = niceTickStep(start: lower, stop: upper, count: 4)
+        guard step > 0 else {
+            return domain
+        }
+
+        switch style {
+        case .line:
+            let niceLower = floor(lower / step) * step
+            let niceUpper = ceil(upper / step) * step
+            return niceLower...niceUpper
+        case .bar:
+            let niceUpper = ceil(upper / step) * step
+            return 0...max(niceUpper, step)
+        }
+    }
+
+    private func niceTicks(for domain: ClosedRange<Double>, targetCount: Int) -> [Double] {
+        let lower = domain.lowerBound
+        let upper = domain.upperBound
+        guard lower.isFinite, upper.isFinite, lower < upper else {
+            return []
+        }
+
+        let step = niceTickStep(start: lower, stop: upper, count: targetCount)
+        guard step > 0 else {
+            return []
+        }
+
+        let first = ceil(lower / step) * step
+        let last = floor(upper / step) * step
+        let decimalPlaces = max(0, -Int(floor(log10(step))))
+        var ticks: [Double] = []
+        var value = first
+
+        while value <= last + step * 0.5 {
+            ticks.append(round(value, decimalPlaces: decimalPlaces))
+            value += step
+        }
+
+        return ticks.reversed()
+    }
+
+    private func thinnedYAxisLabels(_ labels: [Double]) -> [Double] {
+        guard labels.count > 4 else {
+            return labels
+        }
+
+        return labels.enumerated().compactMap { index, label in
+            index.isMultiple(of: 2) ? label : nil
+        }
+    }
+
+    private func niceTickStep(start: Double, stop: Double, count: Int) -> Double {
+        let rawStep = abs(stop - start) / Double(max(1, count))
+        guard rawStep.isFinite, rawStep > 0 else {
+            return 0
+        }
+
+        let power = floor(log10(rawStep))
+        let base = pow(10, power)
+        let error = rawStep / base
+
+        let factor: Double
+        if error >= sqrt(50) {
+            factor = 10
+        } else if error >= sqrt(10) {
+            factor = 5
+        } else if error >= sqrt(2) {
+            factor = 2
+        } else {
+            factor = 1
+        }
+
+        return factor * base
+    }
+
+    private func round(_ value: Double, decimalPlaces: Int) -> Double {
+        guard decimalPlaces > 0 else {
+            return value.rounded()
+        }
+
+        let scale = pow(10, Double(decimalPlaces))
+        return (value * scale).rounded() / scale
     }
 }
 
